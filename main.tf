@@ -45,7 +45,8 @@ resource "aws_iam_role" "codebuild_role" {
 
 resource "aws_iam_role_policy" "codebuild_policy" {
   role = aws_iam_role.codebuild_role.name
-  
+  name = "flask-demo-codebuild-policy"
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -104,7 +105,7 @@ resource "aws_codebuild_project" "app_build" {
   service_role = aws_iam_role.codebuild_role.arn
   
   artifacts {
-    type = "NO_ARTIFACTS"
+    type = "CODEPIPELINE"
   }
   
   environment {
@@ -126,8 +127,7 @@ resource "aws_codebuild_project" "app_build" {
   }
   
   source {
-    type      = "GITHUB"
-    location  = "https://github.com/${var.github_repo}.git"
+    type      = "CODEPIPELINE"
     buildspec = <<EOF
 version: 0.2
 
@@ -137,7 +137,7 @@ phases:
       - echo Logging in to Amazon ECR...
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY_URI
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
-      - IMAGE_TAG=$${COMMIT_HASH:=-latest}
+      - IMAGE_TAG=$${COMMIT_HASH:-latest}
   
   build:
     commands:
@@ -152,7 +152,6 @@ phases:
       - docker push $ECR_REPOSITORY_URI:$IMAGE_TAG
       - echo Writing image definitions file...
       - echo '{"ImageURI":"'$ECR_REPOSITORY_URI:$IMAGE_TAG'"}' > imageDefinition.json
-      - aws ecs update-service --cluster flask-demo-cluster --service flask-demo-service --force-new-deployment
 
 artifacts:
   files:
@@ -161,21 +160,81 @@ EOF
   }
 }
 
-# Create webhook
-resource "aws_codebuild_webhook" "github_webhook" {
-  project_name = aws_codebuild_project.app_build.name
-  
-  filter_group {
-    filter {
-      type    = "EVENT"
-      pattern = "PUSH"
-    }
-    
-    filter {
-      type    = "HEAD_REF"
-      pattern = "refs/heads/${var.github_branch}"
-    }
-  }
+# S3 bucket for CodePipeline artifacts
+resource "aws_s3_bucket" "artifact_bucket" {
+  bucket_prefix = "flask-demo-artifacts-"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_public_access_block" "block_public_access" {
+  bucket = aws_s3_bucket.artifact_bucket.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# IAM role for CodePipeline
+resource "aws_iam_role" "codepipeline_role" {
+  name = "flask-demo-codepipeline-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "codepipeline.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "codepipeline_policy" {
+  name = "flask-demo-codepipeline-policy"
+  role = aws_iam_role.codepipeline_role.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:GetBucketVersioning",
+          "s3:PutObject"
+        ]
+        Resource = [
+          aws_s3_bucket.artifact_bucket.arn,
+          "${aws_s3_bucket.artifact_bucket.arn}/*"
+        ]
+        Effect = "Allow"
+      },
+      {
+        Action = [
+          "codebuild:BatchGetBuilds",
+          "codebuild:StartBuild"
+        ]
+        Resource = aws_codebuild_project.app_build.arn
+        Effect   = "Allow"
+      },
+      {
+        Action = [
+          "ecs:DescribeServices",
+          "ecs:DescribeTaskDefinition",
+          "ecs:DescribeTasks",
+          "ecs:ListTasks",
+          "ecs:RegisterTaskDefinition",
+          "ecs:UpdateService"
+        ]
+        Resource = "*"
+        Effect   = "Allow"
+      }
+    ]
+  })
 }
 
 # ECS Cluster
@@ -216,6 +275,11 @@ resource "aws_security_group" "ecs_sg" {
   }
 }
 
+# Create CloudWatch log group
+resource "aws_cloudwatch_log_group" "ecs_logs" {
+  name = "/ecs/flask-demo"
+}
+
 # ECS Task Definition
 resource "aws_ecs_task_definition" "app_task" {
   family                   = "flask-demo-task"
@@ -250,11 +314,6 @@ resource "aws_ecs_task_definition" "app_task" {
   ])
 }
 
-# Create CloudWatch log group
-resource "aws_cloudwatch_log_group" "ecs_logs" {
-  name = "/ecs/flask-demo"
-}
-
 # ECS Service
 resource "aws_ecs_service" "app_service" {
   name            = "flask-demo-service"
@@ -268,6 +327,121 @@ resource "aws_ecs_service" "app_service" {
     security_groups  = [aws_security_group.ecs_sg.id]
     assign_public_ip = true
   }
+  
+  lifecycle {
+    ignore_changes = [task_definition]
+  }
+}
+
+# Create CodePipeline with webhook
+resource "aws_codepipeline" "pipeline" {
+  name     = "flask-demo-pipeline"
+  role_arn = aws_iam_role.codepipeline_role.arn
+
+  artifact_store {
+    location = aws_s3_bucket.artifact_bucket.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "ThirdParty"
+      provider         = "GitHub"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        Owner                = split("/", var.github_repo)[0]
+        Repo                 = split("/", var.github_repo)[1]
+        Branch               = var.github_branch
+        OAuthToken           = var.github_token
+        PollForSourceChanges = "false"
+      }
+    }
+  }
+
+  stage {
+    name = "Build"
+
+    action {
+      name             = "BuildAndPush"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      version          = "1"
+      input_artifacts  = ["source_output"]
+      output_artifacts = ["build_output"]
+
+      configuration = {
+        ProjectName = aws_codebuild_project.app_build.name
+      }
+    }
+  }
+
+  stage {
+    name = "Deploy"
+
+    action {
+      name            = "Deploy"
+      category        = "Deploy"
+      owner           = "AWS"
+      provider        = "ECS"
+      version         = "1"
+      input_artifacts = ["build_output"]
+
+      configuration = {
+        ClusterName = aws_ecs_cluster.app_cluster.name
+        ServiceName = aws_ecs_service.app_service.name
+        FileName    = "imageDefinition.json"
+      }
+    }
+  }
+}
+
+# Create webhook for the pipeline
+resource "aws_codepipeline_webhook" "github_webhook" {
+  name            = "flask-demo-webhook"
+  authentication  = "GITHUB_HMAC"
+  target_action   = "Source"
+  target_pipeline = aws_codepipeline.pipeline.name
+
+  authentication_configuration {
+    secret_token = var.github_token
+  }
+
+  filter {
+    json_path    = "$.ref"
+    match_equals = "refs/heads/${var.github_branch}"
+  }
+}
+
+# Register the webhook with GitHub
+resource "null_resource" "register_webhook" {
+  provisioner "local-exec" {
+    command = <<EOF
+      curl -X POST \
+        -H "Authorization: token ${var.github_token}" \
+        -H "Accept: application/vnd.github.v3+json" \
+        https://api.github.com/repos/${var.github_repo}/hooks \
+        -d '{
+          "name": "web",
+          "active": true,
+          "events": ["push"],
+          "config": {
+            "url": "${aws_codepipeline_webhook.github_webhook.url}",
+            "content_type": "json",
+            "insecure_ssl": "0",
+            "secret": "${var.github_token}"
+          }
+        }'
+    EOF
+  }
+
+  depends_on = [aws_codepipeline_webhook.github_webhook]
 }
 
 # Output values
@@ -285,4 +459,13 @@ output "ecs_cluster_name" {
 
 output "ecs_service_name" {
   value = aws_ecs_service.app_service.name
+}
+
+output "codepipeline_name" {
+  value = aws_codepipeline.pipeline.name
+}
+
+output "webhook_url" {
+  value     = aws_codepipeline_webhook.github_webhook.url
+  sensitive = true
 }
