@@ -1,10 +1,21 @@
-# Terraform files
-.terraform/
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files
 *.tfstate
 *.tfstate.*
-terraform.tfvars
 
-# Python files
-__pycache__/
-*.py[cod]
-*$py.class
+# Crash log files
+crash.log
+crash.*.log
+
+# Terraform lock file
+.terraform.lock.hcl
+
+# Local environment variables
+*.tfvars
+*.tfvars.json
+
+# CLI configuration files
+.terraformrc
+terraform.rc
